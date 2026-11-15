@@ -1,0 +1,15 @@
+[
+  {
+    "Name": "Yeni Profil",
+    "Projects": [
+      {
+        "Path": "CipherSearch.Web\\CipherSearch.Web.csproj",
+        "Action": "Start"
+      },
+      {
+        "Path": "..\\Frontend\\CipherSearch.UI.esproj",
+        "Action": "Start"
+      }
+    ]
+  }
+]

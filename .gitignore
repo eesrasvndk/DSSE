@@ -1,0 +1,8 @@
+.env
+**/bin/
+**/obj/
+**/node_modules/
+Backend/CipherSearch.Web/wwwroot/
+tmp/
+results/
+DataSet/raw/

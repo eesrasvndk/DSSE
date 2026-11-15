@@ -1,0 +1,210 @@
+DSSE TASARIMI VE KAMARA 2012 UYGULAMASI
+
+Tasarımın amacı yöntemleri aynı belge/anahtar/depolama/deney altyapısına bağlamak,
+fakat yönteme özel indeks ve istemci durumunu birbirine karıştırmamaktır.
+
+Güven sınırı
+React -> güvenilir ASP.NET istemci servisi -> depolama ASP.NET API -> PostgreSQL/MinIO.
+Tarayıcı ve istemci servisi güvenilir kabul edilir. Kullanıcı metni istemciye verir.
+Anahtar türetme, kelimelere ayırma, AES-GCM şifreleme, token üretme ve sonuç çözme
+burada yapılır. Depolama servisine açık kelime veya belge metni gönderilmez.
+İki süreç aynı makinede çalışsa da ayrı sorumluluklardır; farklı endpoint kullanırlar.
+
+Kod yerleşimi
+Backend/CipherSearch.Encryption: AES-GCM, HKDF, protokol modelleri, HMAC, MITRA ve Kamara 2012.
+Backend/CipherSearch.Client: DocumentClient, normalizasyon, DPAPI LocalVault.
+Backend/CipherSearch.Web: giriş, React'e API ve güvenilir çalışma alanı.
+Backend/CipherSearch.Server: şifreli indeks işlemleri, PostgreSQL ve MinIO adaptörleri.
+Backend/CipherSearch.Tests: yaşam döngüsü, oracle, kripto ve depolama testleri.
+Frontend: React. DataSet: CipherSearch'ten alınmış ham/işlenmiş Enron ve veri betikleri.
+
+Ortak arayüz
+IClientSearchScheme: Initialize, PrepareMutation, BeginSearch, ContinueSearch.
+IServerSearchScheme: ApplyMutation, Search. IIndexStore: opak adres/değer depolama.
+IndexScope: veri kümesi + yöntem + nesil + anahtar sürümü. Aynı yöntem bile başka
+neslin indeksini kullanamaz. Yeni yöntem mevcut naive/MITRA durumunu değiştirmemeli.
+TrustedDocument açık kelimeleri içerir ve yalnız istemcide kalır. Protokol mesajları
+adres/token ve şifreli değer taşır. Tekrar denemeler OperationId ile idempotenttir.
+Bekleyen işlem ve yeni sayaç durumu gönderimden önce yerelde korunur; alındı yanıtından
+sonra kalıcı durum tamamlanır. Bu, bağlantı kopması ile eski yedek geri yüklemeyi aynı
+problem yapmaz: eski sayaç yedeği geri yüklemek adres tekrarına ve gizlilik kaybına yol açar.
+
+Yöntemlerin uygulaması
+Naive HMAC: kelime için sabit HMAC tokenı, token altında AES-GCM şifreli posting list.
+Güncellemeler ilgili listeyi yeniden şifreler. Yerel posting-list durumu tüm indekse aittir.
+MITRA: kelime başına sayaç; ayrı alan etiketleriyle PRF adresi ve XOR maskesi.
+Ekleme/silme yeni kayıt ekler; arama geçmişi istemcide açıp kronolojik olarak işler.
+Değişmeyen kelimeler için gereksiz add/delete kaydı üretilmez. Belge sürümü istemcide tutulur.
+Kaynak: CCS 2018, Algoritma 1–3
+https://www.cs.yale.edu/homes/cpap/published/forward-privacy-CCS18.pdf
+
+Anahtar ve nonce
+32 bayt rastgele ana anahtar, kapsam/amaç ayrımıyla HKDF. Yerel anahtar/durum Windows
+DPAPI ile korunur. Belge ve naive liste AES-256-GCM kullanır. Nonce kaynağı her seferinde
+rastgele üretmek yerine rastgele başlangıçlı, diskte blok rezerve eden 96 bit sayaçtır.
+Bu, Execution of Methods anlatımındaki rastgele nonce seçiminin uygulama uyarlamasıdır;
+aynı anahtarla tekrar kullanmama koşulunu sağlar, eski vault yedeğine dönüş güvenli değildir.
+
+Sunucu gözlemleri
+Naive aynı tokenın tekrarını ve değişen şifreli liste boyunu gösterir. MITRA aramada
+ilgili geçmiş adresleri gösterir. Dosya erişimi ve trafik zamanı ayrıca gözlenebilir.
+Mevcut MITRA'da padding yoktur; silmede blob yüklenmez, boyut ve zaman korelasyonu vardır.
+Geri alınan sayaçla üretilen adresi sunucu reddeder, fakat adresi zaten görmüştür.
+Bu uygulamaya uçtan uca Type-II güvenlik ispatı atfedilmez. XOR indeks kayıtları MAC'li
+değildir. GCM şifreli belge bozulmasını saptar; tüm arama sonucu bütünlüğü W9 kapsamıdır.
+MITRA'da eski bloblar hemen fiziksel silinmez; mantıksal silme arama sonuçlarını kaldırır.
+
+KAMARA 2012: KAYNAK VE UYGULAMA
+Kaynak: Kamara–Papamanthou–Roeder, CCS 2012, Bölüm 4, Şekil 2–3.
+https://www.cs.yale.edu/homes/cpap/published/dsse_first.pdf
+Kod: Backend/CipherSearch.Encryption/SearchSchemes/Kamara/
+KamaraProtocol.cs: tokenlar, sabit uzunluklu kodlama ve kriptografik işlemler.
+KamaraClientScheme.cs: güvenilir kurulum, SrchToken, AddToken, DelToken.
+KamaraServerScheme.cs: şifreli listeler üzerinde Search, Add ve Del.
+Yöntem kimliği kamara-2012-v1; diğer yöntemlerle indeks/anahtar/durum paylaşılmaz.
+
+MAKALEDEKİ YAPILAR VE İŞLEMLER
+As, rastgele konumlardaki (belge kimliği, sonraki As adresi) düğümlerini tutar.
+Ad düğümü sırasıyla şu alanları içerir: aynı belgenin sonraki Ad adresi,
+kelime listesindeki önceki/sonraki düğümlerin Ad adresleri, kendi As adresi,
+önceki/sonraki As adresleri ve F_K1(w). Her As düğümünün bir Ad eşi vardır.
+Ts[F_K1(w)] iki baş adresini G_K2(w) ile maskeler. Td[F_K1(f)] belgenin Ad
+listesi başını G_K2(f) ile maskeler. As/Ad düğümleri sırasıyla H1/H2 ile
+maskelenir, her düğümün ayrı rastgele r/r' değeri vardır.
+
+KeyGen mevcut RNG ile üretilmiş, DPAPI korumalı ana anahtarı kullanır; kapsam
+anahtarından ayrı HKDF alanlarıyla K1/K2/K3 türetilir. K4 mevcut Document
+anahtarıdır. Ana anahtar ve K1/K2/K3/K4 sunucuya gönderilmez.
+Setup/Enc tamamen istemcide yapılır: iki dizide bağımsız rastgele konumlar,
+çift yönlü komşuluklar, belge silme zincirleri, maskeli tablo başları, z adet
+boş konum çifti ve kalan hücrelerde rastgele dolgu oluşturulur. İlk veri kümesi
+sunucuya Add tokenları dizisi olarak gönderilmez. Şifreli belgeleri alan
+PrepareSetupAsync aşırı yüklemesi kapasiteyi makaledeki |c|/8+z hesabıyla,
+c'nin JSON aktarımındaki bayt uzunluğundan üretir. Diğer aşırı yükleme açıkça
+belirtilmiş kamusal dolgu sınırı alır; bu sınır gizli kelime sayısından
+hesaplanmamalıdır. HTTP istemcisi boş küme ile başladığı için kapasite=z'dir.
+
+Search tokenı (F(w),G(w),P(w)) olup sunucu Ts'den As başını bulur ve H1 ile
+ilgili zinciri açar. Arama tüm indeksi taramaz; sonuçların belge kimlikleri
+sunucu tarafından görülür. Belge içeriğinin SKE.Enc/Dec işlemleri mevcut
+DocumentClient AES-GCM katmanındadır; arama sonucundaki kimlikle şifreli belge
+alınır. Sürüm bilgisi güvenilir istemcinin belge-sürüm tablosundan tamamlanır.
+
+AddToken her benzersiz kelime için sıfır işaretçili As/Ad şifreli düğümleri,
+F(w) ve G(w) üretir. Sunucu Ts[free]'den eşlenmiş boş As/Ad hücrelerini alır,
+kelime zincirinin başına ekler, eski başın Ad işaretçilerini XOR ile değiştirir,
+yeni belge silme zincirini bağlar ve iki tabloyu günceller. Add tokenı P(w)
+ve P(f) içermez. Kapasite sabittir; dolunca yeniden kurulum gerekir.
+
+DelToken (F(f),G(f),P(f),id(f)) ile yalnız ilgili belge Ad listesi açılır.
+Sunucu bu listedeki altı adres ve F(w) üzerinden önceki As düğümünün ileri
+bağını, iki komşunun Ad alanlarını ve gerektiğinde Ts başını XOR farklarıyla
+günceller. Silinen Ad rastgele doldurulur; As hücresi eski boş liste başı ve
+Ad eşinin adresiyle Ts[free]'ye bağlanır. Td kaydı ve belge kaldırılır.
+Sunucuda açık kelime-belge haritası veya açık komşuluk tablosu tutulmaz.
+
+BASILI SÖZDE KODDAKİ TUTARSIZLIKLARIN AÇIK DÜZELTMELERİ
+Bunlar yazarların yayımladığı bir errata iddiası değil, Enc düğüm tanımlarını
+ve doğru dinamik işlemleri tutarlı kılan uygulama yorumlarıdır:
+- Add.1'deki 'Td içinde değilse reddet' koşulu ters çevrilmiştir: yeni dosya
+  kabul edilir, mevcut dosya reddedilir.
+- Add.2(g)'de F(w) ikinci kez XOR'lanmaz; AddToken bunu zaten düğüme koyar.
+  Aksi halde silmede gereken mu alanı sıfırlanır.
+- Add.2(g,h)'de önceki düğüm/ilk baş çelişkisi, Enc ile aynı ileri belge
+  zinciri ve ilk düğümü gösteren Td kullanılarak giderilmiştir.
+- Del'de eksik liste başı durumu Ts[mu] XOR (eskiBaş XOR yeniBaş) ile
+  tamamlanmıştır. Son düğüm silinince Ts kaydı kaldırılır. END=0 adresine
+  erişilmez. Yeni kelime, boş belge ve boş liste durumları açık işlenir.
+- Search düğümündeki fazladan sıfır ve Td genişlik tutarsızlıklarında Enc'deki
+  alan tanımları esas alınır. Şekil 2'de başa ekleme esas alınmıştır;
+  Bölüm 4.1'deki sona ekleme anlatımı bununla çelişir.
+
+TEKNİK SEÇİMLER VE GÜVENLİK SINIRI
+k=256; belge kimliği 16 bayt Guid; adresler 4 bayt little-endian, 1..kapasite,
+END=0. As şifreli kayıtları 52, Ad kayıtları 88 bayttır. Boş As hücresi
+sıfır kimlik, nextFree, dualFree ve rastgele kalan baytlardan oluşur.
+F/P: HMAC-SHA256; G/H1/H2: farklı alan etiketleriyle HKDF-Expand/HMAC-SHA256.
+Uzun düğüm maskesi için 32 baytlık değer tekrarlanmaz. Bu, Bölüm 6.1'deki
+HMAC yaklaşımının somut .NET uyarlamasıdır; gerçek random oracle değildir.
+Kelime UTF-8 ve tür etiketiyle, indekslenen dosya f ise kimlik+sürüm+sıralı
+kelimelerin uzunluk önekli tanımıyla kodlanır. f yalnız belge kimliği değildir.
+Makalenin Bölüm 3 ve dipnot 6'daki indekslenebilir dosya tanımı yaklaşımı
+kullanılır; özgün C++ uygulamasının ikili çıktısı taklit edilmez.
+
+IIndexStore içinde 0x4B ve yapı türü ile ayrılan adresler kullanılır:
+As/Ad için sayısal indis, Ts/Td için 32 bayt F çıktısı. Ts[free] ayrı sabit
+adrestedir. Ek kayıt yalnız kapasite ve kurulumun tekrar gönderimini tanıyan
+şifreli anlık görüntü özetini tutar. SQL şeması veya yeni servis eklenmemiştir.
+HTTP istemcisinin varsayılanı 16.384 hücre çiftidir; DocumentClient kurucusu
+kamaraCapacity parametresi alır. Çekirdek kod 1..1.000.000 hücreyi kabul eder;
+HTTP gövde sınırı büyük kurulumlarda ayrıca geçerlidir.
+
+Makaledeki arama/erişim, eklenen-silinen belgenin kelime tokenları ve komşuluk
+sızıntıları korunur; forward privacy veya kötü niyetli sunucuya karşı tam
+sonuç bütünlüğü iddia edilmez. XOR ile değiştirilen indeks MAC'li değildir.
+AES-GCM yalnız belge içeriğini doğrular. İşlem kimliği, sürüm ve JSON trafik
+boyutu gibi mevcut uygulama metaverileri de gözlenebilir; tüm web yığınına
+makalenin güvenlik teoremi atfedilmez.
+
+UPDATE, HATA VE KURTARMA
+Update özgün ayrı protokol değil, Delete ardından Add bileşimidir. Çekirdek
+sunucu değişiklikleri geçici bir yazma kümesinde hazırlar; kapasite veya token
+hatasında eski indeks yazılmadan kalır. Kalıcı yazma sırasındaki hata için
+IIndexStore sağlayıcısı transaction ve nesil başına seri erişim sağlamalıdır.
+Mevcut PostgreSQL hostu bu koşulları sağlar; belge yükleme hatasında indeks,
+metaveri ve alındı kaydı geri alınır. MinIO'daki yarım yükleme cleanup ile
+kaldırılır. Aynı OperationId yeniden gönderilince kayıtlı yanıt döner.
+İstemci tokenı, bekleyen durumu ve OperationId'yi gönderimden önce DPAPI ile
+saklar; yanıt kaybında yeniden başlatma bunu kurtarır. Kurulum da aynı anlık
+görüntüyle tekrar edilebilir, canlı nesli eski kurulumla geri sarmaz.
+İşlemleri transaction dışında ayrı Delete ve Add olarak çağıran bir uygulama,
+Add başarısızsa silinmiş belgeyle kalır; bu kullanım atomik değildir.
+Kalıcı kapasite hatasında istemci bekleyen işlemi otomatik atmaz; aynı işlem
+tekrar başarısız olur. Daha büyük kapasiteli yeni nesil kurulmalıdır. Eski
+istemci durumuna/yedeğine dönmek güvenli bir kurtarma yöntemi değildir.
+
+DOĞRULAMA
+KamaraTests: ilk/orta/son silme, tüm listeyi silme, çok kelimeli ve boş belge,
+yinelenen kelime, yeniden ekleme, kapasite dolması, karma rastgele işlemler,
+açık belge kümesi oracle karşılaştırması, her çift düğüm ve komşu işaretçisi,
+boş liste ayrıklığı, dokunulmayan dolgu, token/anahtar ve kapsam ayrımı.
+KamaraLifecycleTests: gerçek DocumentClient, DPAPI, AES-GCM ve bellek hostuyla
+kurulum/alındı kaybı, yeniden başlatma, Update/Delete/re-add.
+KamaraStorageTests: gerçek PostgreSQL/MinIO, yükleme sonrası hata, tam indeks
+geri alma, aynı işlemin tekrarı ve eşzamanlı sürüm çatışması.
+Son doğrulama (1 Kasım 2026): 75 test başarılı, 0 başarısız, 0 atlanan.
+Bunların 15'i Kamara testidir (13 çekirdek, 1 istemci yaşam döngüsü,
+1 gerçek depolama); mevcut 60 test de geçti. PostgreSQL/MinIO testleri
+CIPHERSEARCH_INTEGRATION=1 ile gerçekten çalıştırıldı.
+Sonuç dosyası: tmp/kamara-validation/all.trx.
+Çözüm derlemesi: 0 uyarı, 0 hata. Vite üretim derlemesi de başarılı.
+İlk normal Release derlemesi çalışan servislerin DLL kilitleri nedeniyle
+kopyalama aşamasında başarısız oldu. İlk sandbox test çalışması testhost
+bağlantı zaman aşımına uğradı. Testler sandbox dışında, derleme aşağıdaki
+ayrı çıktı yolu ile başarıyla tekrarlandı; çalışan servisler durdurulmadı.
+Çalıştırma: scripts/Run-Checks.ps1; depolama için -Storage.
+Çalışan süreçler Release DLL'lerini kilitlerse doğrulama için
+-p:OutputPath=bin/KamaraValidation/ -m:1 -nr:false -p:UseSharedCompilation=false
+kullanılabilir. Son komutlar:
+dotnet build Backend/CipherSearch.sln --no-restore -c Release -m:1 -nr:false -p:UseSharedCompilation=false -p:OutputPath=bin/KamaraValidation/
+dotnet test Backend/CipherSearch.Tests/CipherSearch.Tests.csproj --no-build --no-restore -c Release -m:1 -nr:false -p:OutputPath=bin/KamaraValidation/ --results-directory tmp/kamara-validation --logger "trx;LogFileName=all.trx"
+Test için CIPHERSEARCH_ENV_FILE projenin .env dosyasını gösterdi; içerik
+rapora veya loglara yazılmadı. Arayüz: vite build --emptyOutDir false.
+
+OLUŞTURULAN/DEĞİŞTİRİLEN KAYNAKLAR
+Yeni: Backend/CipherSearch.Encryption/SearchSchemes/Kamara/ altında
+KamaraProtocol.cs, KamaraClientScheme.cs, KamaraServerScheme.cs.
+Yeni: Backend/CipherSearch.Tests/ altında KamaraTests.cs,
+KamaraLifecycleTests.cs, KamaraStorageTests.cs.
+Değişen: Backend/CipherSearch.Encryption/Contracts/ProtocolModels.cs ve
+Cryptography/KeyDerivation.cs; Backend/CipherSearch.Client/DocumentClient.cs
+ve Program.cs; Backend/CipherSearch.Server/SearchEngine.cs ve
+Storage/RuntimeDatabase.cs; Backend/CipherSearch.Web/Workspace.cs;
+Frontend/src/main.jsx ve bu mevcut MIMARI_VE_KAMARA.txt belgesi.
+Vite ayrıca mevcut wwwroot altında index.html ve yeni derlenmiş JS üretti.
+
+Naive HMAC ve MITRA'nın SearchSchemes altındaki iç kodları değiştirilmemiştir.
+Ortak host/istemcide yalnız yöntem seçimi, Kamara kurulumu, durum adı, token
+kaydı ve izin verilen yöntem kimlikleri genişletilmiştir. Önceden kapsam dışı
+olan saldırı simülasyonu, AND/tam sonuç bütünlüğü ve ölçek benchmarkları bu
+çalışmayla tamamlanmış sayılmaz.

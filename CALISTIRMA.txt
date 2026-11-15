@@ -1,0 +1,44 @@
+DSSE INTERIM ÇALIŞTIRMA
+
+PostgreSQL ve MinIO: mevcut CipherSearch kurulumu kullanılır. Yeniden kurulum yok.
+.env bağlantı bilgileri CipherSearch'ten alınmıştır. DSSE, aynı veritabanında dsse
+şemasını ve MinIO'da dsse-documents bucket'ını kullanır. CipherSearch kayıtlarıyla
+karışmaz. Kaynak projedeki kod adları gereksiz yeniden adlandırma yapılmadan korunur.
+
+Üç terminal açın. İki backend süreci güvenilir istemci/depolama ayrımını korur.
+
+Terminal 1
+cd C:\Users\mahmu\Desktop\DSSE\Backend\CipherSearch.Server
+dotnet run
+
+Terminal 2
+cd C:\Users\mahmu\Desktop\DSSE\Backend\CipherSearch.Web
+dotnet run
+
+Terminal 3
+cd C:\Users\mahmu\Desktop\DSSE\Frontend
+npm install
+npm run dev
+
+Tarayıcı: http://127.0.0.1:5173
+Depolama API: 5180. Güvenilir istemci API: 5190.
+Giriş parolası proje kökündeki .env dosyasında DSSE_DEMO_PASSWORD alanındadır.
+Windows DPAPI ile korunan anahtarlar/durum tmp/web-vaults altında saklanır.
+Bu yerel, tek sahipli demodur; internet dağıtımı ve çok kullanıcılı RBAC değildir.
+
+Naive HMAC veya MITRA seçin. Enron 1.000 yükle düğmesi seçili yönteme aktarır.
+Tekrar basmak mevcut/düzenlenmiş/silinmiş kaynak kimliklerini yeniden yazmaz.
+Belge ekleyin, tek kelime arayın, düzenleyin ve silin. Arama sonrası oracle kontrolü
+şifreli belgeleri güvenilir tarafta açıp tarar; indeks sonucundan bağımsız karşılaştırır.
+Bu kontrol ek trafik ve zaman üretir; benchmark ölçümü değildir.
+
+Doğruluk testleri
+cd C:\Users\mahmu\Desktop\DSSE
+dotnet test Backend/CipherSearch.Tests
+
+Enron oracle testleri için ayrıca ortam değişkenleri:
+$env:CIPHERSEARCH_ORACLE_ROOT = (Get-Location).Path
+$env:CIPHERSEARCH_ORACLE_OUT = Join-Path (Get-Location) 'results/oracle'
+dotnet test Backend/CipherSearch.Tests --filter FullyQualifiedName~EnronOracleTests
+
+Benchmark çalıştırmayın. Kamara eklendikten sonraki kıyaslar KIYASLAMA_PLANI.txt içindedir.

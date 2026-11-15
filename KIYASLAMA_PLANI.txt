@@ -1,0 +1,55 @@
+KAMARA EKLENDİKTEN SONRA YAPILACAK KIYASLAMALAR
+
+Kaynak: Esra Sevindik – Capstone Project Plan.docx.
+Bu dosya deney planıdır; ölçüm veya başarı sonucu değildir. Kullanıcının kararıyla
+benchmark ve yöntemlerin performans kıyası üç yöntem tamamlandıktan sonra yapılacak.
+Karşılaştırılan yöntemler: naive HMAC, temel dinamik yöntem olarak Kamara, MITRA.
+
+1. ÖN KOŞUL: DOĞRULUK
+Her yöntem aynı başlangıç belgeleri ve aynı ekleme/güncelleme/silme dizisiyle çalışır.
+Her adımdan sonra dönen belge kimlikleri, güvenilir taraftaki açık metin referansıyla
+küme olarak karşılaştırılır. Hedef %100 eşleşmedir. Sıralama farkı hata değildir.
+Bu kontrol bir performans kıyası değil, kıyasa katılma koşuludur.
+
+2. RQ1: MALİYET VE ÖLÇEKLENEBİLİRLİK
+Şifreleme, indeksleme, arama, güncelleme, silme ve doğrulama süreleri: medyan ve p95.
+Ekleme de ayrı işlem olarak raporlanır; belge şifreleme ve indeks güncelleme maliyeti
+birbirinden ayrılır. İlk indeks kurma süresi ayrıca gösterilir.
+İndeks boyutu, istemci durum boyutu ve aktarılan istek/yanıt baytları ölçülür.
+Enron ölçekleri: 1.000, 5.000, 10.000 ve 50.000 belge; her koşul için 5 tekrar.
+Planda 50.000 belge, süre sorunu olursa genişletme hedefi olarak ele alınabilir.
+Sık/seyrek kelimeler ve güncelleme geçmişi uzun kelimeler değerlendirilir.
+H1 hedefi: MITRA tek kelime araması, 10.000 belgede p95 <= 500 ms.
+Bu bir hipotez/hedeftir; uygulanmış veya doğrulanmış sonuç değildir.
+
+3. RQ2: SIZINTI VE SALDIRI BAŞARISI
+Her yöntemin add/update/delete/search işlemlerinde sunucuya görünen bilgi yazılır.
+Search pattern, access pattern, update leakage ve sonuç hacmi ayrı ele alınır.
+File-injection: sorgu kurtarma oranı karşılaştırılır. Plandaki hedef naive ve temel
+dinamik yöntemde >= %90; MITRA için enjeksiyondan ÖNCE yapılan sorgularda rastgele
+tahminden iyi olmama. Bu hedef bütün saldırılar için genel güvenlik garantisi değildir.
+Count attack: saldırgan belge bilgisinin %25, %50, %75 ve %100 olduğu koşullarda
+sorgu kurtarma oranı raporlanır. Sonuç sayısı gizlenmediğinde MITRA da etkilenebilir.
+Saldırgan yalnız sunucu görünümünü kullanmalı; istemci anahtarı ve oracle yasaktır.
+Temel indeks protokolünün sızıntısı ile dosya erişimi, zamanlama ve paket boyutu gibi
+uygulama sızıntıları ayrı raporlanır. MITRA geçmiş kayıt sayısı, canlı sonuç sayısıyla
+aynı şey değildir; count attack deneyinde kullanılan gözlem açıkça tanımlanmalıdır.
+
+4. RQ3: EK ÖZELLİKLERİN MALİYETİ
+En uygun yöntem üzerinde tek kelime sorgusuna karşı AND sorgusunun ek süre, trafik
+ve sızıntısı ölçülür. AND, istemcide tek kelime sonuçlarını kesiştirerek yapılır.
+Bütünlük doğrulaması kapalı/açık maliyeti ölçülür. Şifreli belge ve indeks kayıtları
+bozularak tespit oranı sınanır. Plandaki hedef %100 tespittir. AES-GCM tek başına
+arama sonucundan kayıt eksiltmeyi veya eski sonuç döndürmeyi tespit garantisi vermez.
+
+5. ORTAK DENEY KOŞULLARI
+Aynı veri altkümesi, normalizasyon, sorgular, işlem dizisi, donanım ve servisler.
+Her yönteme ayrı indeks, anahtar kapsamı ve istemci durumu. Tekrarlar temiz ve ayrı
+deney kapsamlarında çalışır. Oracle ve arayüz maliyeti arama süresine karıştırılmaz.
+Medyan/p95 ile birlikte tekrarlar ve deney ortamı saklanır; W11'de güven aralıkları
+ve maliyet-sorgu kurtarma oranı grafiği hazırlanır.
+
+TAKVİM
+Kullanıcı kararı: Kamara tamamlanana kadar benchmark yok.
+Plan: W8 saldırılar; W9 AND ve bütünlük; W10 ölçekleme; W11 tam değerlendirme.
+Mevcut interim: naive HMAC + MITRA uygulaması ve doğruluk doğrulaması.
