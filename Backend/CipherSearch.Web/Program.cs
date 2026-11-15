@@ -44,6 +44,122 @@ app.Use(async (ctx, next) =>
 });
 app.UseDefaultFiles();
 app.UseStaticFiles();
+app.MapGet("/api/overview", async (Workspace w) =>
+{
+    string[] schemes = [SchemeIds.NaiveHmac, SchemeIds.Kamara, SchemeIds.Mitra];
+    var items = new List<object>();
+    foreach (var scheme in schemes)
+    {
+        try
+        {
+            items.Add(await w.Run(scheme, async (client, vault, path) =>
+            {
+                var files = Directory.EnumerateFiles(path, "doc-*.state")
+                    .Select(f => vault.Load<CipherSearch.Client.LocalDocument>(Path.GetFileNameWithoutExtension(f))).ToArray();
+                var live = files.Where(d => !d.Deleted).ToArray();
+                var deletedCount = files.Count(d => d.Deleted);
+                var uniqueKeywords = live.SelectMany(d => d.Keywords).Distinct(StringComparer.Ordinal).Count();
+                var totalPostings = live.Sum(d => d.Keywords.Length);
+                var status = await client.Status();
+                return (object)new
+                {
+                    scheme,
+                    available = true,
+                    documentCount = live.Length,
+                    deletedCount,
+                    uniqueKeywords,
+                    totalPostings,
+                    status,
+                    requestBytes = client.RequestBytes,
+                    responseBytes = client.ResponseBytes
+                };
+            }));
+        }
+        catch
+        {
+            items.Add(new { scheme, available = false, documentCount = 0, deletedCount = 0, uniqueKeywords = 0, totalPostings = 0, status = (object?)null, requestBytes = 0L, responseBytes = 0L });
+        }
+    }
+    return new { schemes = items };
+});
+app.MapPost("/api/seed-demo-all", async (Workspace w) =>
+{
+    var file = Path.GetFullPath(Path.Combine(app.Environment.ContentRootPath, "../../DataSet/processed/enron_1000.jsonl"));
+    var documents = File.ReadLines(file).Take(25).Select(line =>
+    {
+        using var json = System.Text.Json.JsonDocument.Parse(line);
+        var number = json.RootElement.GetProperty("documentId").GetInt32();
+        var id = new Guid(SHA256.HashData(Encoding.UTF8.GetBytes($"dsse-enron-{number}"))[..16]);
+        return (Id: id, Text: json.RootElement.GetProperty("text").GetString()!, Name: $"Enron {number:D4}");
+    }).ToArray();
+    var targetIds = documents.Select(d => d.Id).ToHashSet();
+    string[] schemes = [SchemeIds.NaiveHmac, SchemeIds.Kamara, SchemeIds.Mitra];
+    var results = new List<object>();
+    foreach (var scheme in schemes)
+    {
+        var imported = 0;
+        await w.Run(scheme, async (client, vault, path) =>
+        {
+            foreach (var liveDoc in Workspace.List(vault, path))
+            {
+                if (!targetIds.Contains(liveDoc.DocumentId))
+                    await client.Mutate(MutationKind.Delete, liveDoc.DocumentId, null);
+            }
+            foreach (var document in documents)
+            {
+                var docKey = $"doc-{document.Id:N}";
+                if (vault.Exists(docKey))
+                {
+                    var local = vault.Load<CipherSearch.Client.LocalDocument>(docKey);
+                    if (!local.Deleted) continue;
+                }
+                vault.Save($"name-{document.Id:N}", document.Name);
+                await client.Mutate(MutationKind.Add, document.Id, document.Text);
+                imported++;
+            }
+            return new { imported };
+        });
+        results.Add(new { scheme, imported });
+    }
+    return new { count = documents.Length, results };
+});
+app.MapGet("/api/server-leakage", () =>
+{
+    var leakageFile = Path.GetFullPath(Path.Combine(app.Environment.ContentRootPath, "../../tmp/server-leakage.jsonl"));
+    if (!File.Exists(leakageFile)) return Results.Ok(new { events = Array.Empty<object>() });
+    var lines = File.ReadLines(leakageFile).Reverse().Take(45).ToArray();
+    var events = new List<object>();
+    foreach (var line in lines)
+    {
+        if (string.IsNullOrWhiteSpace(line)) continue;
+        try
+        {
+            var ev = Wire.Decode<LeakageEvent>(Encoding.UTF8.GetBytes(line));
+            events.Add(new
+            {
+                ev.EventId,
+                ev.TimestampUtc,
+                schemeId = ev.Scope.SchemeId,
+                generationId = ev.Scope.GenerationId,
+                ev.OperationId,
+                ev.Operation,
+                ev.Epoch,
+                ev.RequestBytes,
+                ev.ResponseBytes,
+                ev.ElapsedMicroseconds,
+                tokenCount = ev.ObservedTokensBase64.Count,
+                addressCount = ev.ObservedAddressesBase64.Count,
+                observedDocumentCount = ev.ObservedDocumentIds.Count,
+                ev.ReturnedEntryCount,
+                tokenSamples = ev.ObservedTokensBase64.Take(6).Select(Convert.ToHexString).ToArray(),
+                addressSamples = ev.ObservedAddressesBase64.Take(6).Select(Convert.ToHexString).ToArray(),
+                documentIdSamples = ev.ObservedDocumentIds.Take(6).ToArray()
+            });
+        }
+        catch { /* Ignore malformed lines */ }
+    }
+    return Results.Ok(new { events });
+});
 app.MapGet("/api/{scheme}/documents", (string scheme, Workspace w) =>
     w.Run(scheme, async (client, vault, path) => new { documents = Workspace.List(vault, path), status = await client.Status() }));
 app.MapPost("/api/{scheme}/import-enron", async (string scheme, Workspace w) =>
@@ -119,16 +235,30 @@ app.MapPost("/api/verification", async (SearchInput input, Workspace w) =>
         {
             outcomes.Add(await w.Run(scheme, async (client, vault, path) =>
             {
-                var (expected, fingerprint) = await PlaintextReference(client, Workspace.List(vault, path), keyword, true);
-                var matches = await client.Search(keyword);
+                var docList = Workspace.List(vault, path);
+                var (expected, fingerprint) = await PlaintextReference(client, docList, keyword, true);
+                var searchId = Guid.NewGuid();
+                var timer = System.Diagnostics.Stopwatch.StartNew();
+                var matches = await client.Search(keyword, searchId: searchId);
+                var elapsedMs = timer.Elapsed.TotalMilliseconds;
+                SearchObservation? observation = null;
+                try
+                {
+                    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                    observation = await client.ObserveSearch(searchId, timeout.Token);
+                }
+                catch { /* Ignore diagnostic failure */ }
+                var status = await client.Status();
+                var matchedDocs = matches.Select(m => Workspace.Row(vault, Workspace.Get(vault, m.DocumentId))).ToArray();
                 return new VerificationOutcome(scheme, fingerprint, expected.Order().ToArray(),
-                    matches.Select(m => m.DocumentId).Order().ToArray());
+                    matches.Select(m => m.DocumentId).Order().ToArray(), elapsedMs, docList.Length,
+                    status.IndexBytes, status.IndexEntries, status.Epoch, observation, matchedDocs);
             }));
         }
         catch (Exception ex) when (ex is HttpRequestException or InvalidOperationException or
             IOException or CryptographicException or KeyNotFoundException or OperationCanceledException)
         {
-            outcomes.Add(new(scheme, null, null, null));
+            outcomes.Add(new(scheme, null, null, null, 0, 0, 0, 0, 0, null, []));
         }
     }
     var sameDataset = outcomes.All(o => o.Fingerprint is not null) &&
@@ -140,6 +270,7 @@ app.MapPost("/api/verification", async (SearchInput input, Workspace w) =>
         rows = outcomes.Select(o => new
         {
             o.Scheme, o.Expected, o.Actual,
+            o.ElapsedMs, o.DocumentCount, o.IndexBytes, o.IndexEntries, o.Epoch, o.Observation, o.MatchedDocuments,
             status = o.Fingerprint is null ? "Unavailable" : !sameDataset ? "Not comparable" :
                 o.Expected!.Length == o.Actual!.Length && o.Expected.SequenceEqual(o.Actual) ? "PASS" : "FAIL"
         })
@@ -199,5 +330,8 @@ static async Task<(HashSet<Guid> Expected, string? Fingerprint)> PlaintextRefere
     return (expected, hash is null ? null : Convert.ToHexString(hash.GetHashAndReset()));
 }
 
-sealed record VerificationOutcome(string Scheme, string? Fingerprint, Guid[]? Expected, Guid[]? Actual);
+sealed record VerificationOutcome(
+    string Scheme, string? Fingerprint, Guid[]? Expected, Guid[]? Actual,
+    double ElapsedMs, int DocumentCount, long IndexBytes, int IndexEntries,
+    long Epoch, SearchObservation? Observation, DocumentRow[] MatchedDocuments);
 
