@@ -1,33 +1,36 @@
 using System.Diagnostics;
 using System.Runtime.Versioning;
-using System.Security.Cryptography;
-using System.Text.Json;
 using CipherSearch.Client;
 using CipherSearch.Contracts;
 
+// Planning and summarizing need no vault, so they also run where DPAPI is unavailable.
+if (args.FirstOrDefault() == "analyze") { Analyzer.Run(args); return; }
+if (args.FirstOrDefault() == "plan") { BenchmarkPlanner.Run(args); return; }
 if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("The local vault requires Windows DPAPI.");
 await ExperimentRunner.Run(args);
 
 [SupportedOSPlatform("windows")]
 internal static class ExperimentRunner
 {
-    internal sealed record SourceDocument(int DocumentId, string Text);
-    internal sealed record ProcessedDocument(int DocumentId, string[] Tokens);
     internal sealed record OracleDocument(Guid Id, string Text, string[] Words);
-    internal sealed record Measurement(string Scheme, int Run, string Operation, string QueryClass,
-        int ResultCount, double Milliseconds, long RequestBytes, long ResponseBytes);
+    // ItemCount: search = result count; build/setup/ingest = documents; add/update/delete =
+    // keywords of the new content (of the removed document for delete). PreviousItemCount:
+    // keywords of the replaced document for update, otherwise 0.
+    internal sealed record Measurement(string Scheme, int Run, string Operation, string Query, string QueryClass,
+        int ItemCount, int PreviousItemCount, double Milliseconds, long RequestBytes, long ResponseBytes);
+    // IndexBytes/IndexEntries/ClientStateBytes/AlgorithmStateBytes: right after build.
+    // Final*: after the mutation sequence. ClientStateBytes is the whole vault directory;
+    // AlgorithmStateBytes is only the scheme's own state file.
     internal sealed record RunSummary(IndexScope Scope, int Run, int Documents, long IndexBytes,
-        int IndexEntries, long ClientStateBytes, long EncryptedDocumentBytes, string VaultDirectory);
+        int IndexEntries, long ClientStateBytes, long AlgorithmStateBytes, long FinalIndexBytes,
+        int FinalIndexEntries, long FinalClientStateBytes, long FinalAlgorithmStateBytes,
+        long EncryptedDocumentBytes, string VaultDirectory);
     internal sealed record ResumeRecord(IndexScope Scope, string VaultDirectory, OracleDocument[] Documents, string[] Queries);
 
     public static async Task Run(string[] args)
     {
         var command = args.FirstOrDefault() ?? "smoke";
-        string Option(string name, string fallback)
-        {
-            var index = Array.IndexOf(args, name);
-            return index < 0 ? fallback : args.ElementAtOrDefault(index + 1) ?? throw new ArgumentException($"Missing {name} value.");
-        }
+        string Option(string name, string fallback) => CommandLine.Option(args, name, fallback);
         var url = Option("--url", "http://127.0.0.1:5180/");
         var output = Path.GetFullPath(Option("--output", $"tmp/experiments/{DateTime.UtcNow:yyyyMMdd-HHmmss}"));
         Directory.CreateDirectory(output);
@@ -46,55 +49,27 @@ internal static class ExperimentRunner
             return;
         }
         if (command is not ("smoke" or "benchmark" or "validate-dataset"))
-            throw new ArgumentException("Use smoke, benchmark, verify or validate-dataset.");
+            throw new ArgumentException("Use smoke, benchmark, verify, validate-dataset, plan or analyze.");
+        var data = Path.GetFullPath(Option("--data", BenchmarkPlanner.DefaultData));
+        if (command == "validate-dataset")
+        {
+            var (documents, hashes) = BenchmarkPlanner.LoadDocuments(data);
+            File.WriteAllBytes(Path.Combine(output, "normalization.json"), Wire.Encode(new { documents = documents.Length, inputHashes = hashes, passed = true }));
+            Console.WriteLine($"NORMALIZATION PASS: {documents.Length} documents equal Python token sequences.");
+            return;
+        }
         var smoke = command == "smoke";
         var runs = int.Parse(Option("--runs", smoke ? "1" : "5"));
         if (runs is < 1 or > 100) throw new ArgumentException("Runs must be 1..100.");
-        var source = new Dictionary<Guid, OracleDocument>();
-        var inputHashes = new Dictionary<string, string>();
-        if (smoke)
-        {
-            string[][] tokens = [
-                ["alpha", "beta"], ["alpha", "gamma"], ["alpha", "beta", "delta"],
-                ["beta"], [], ["gamma", "delta"], ["epsilon"], ["alpha", "epsilon"]
-            ];
-            for (var i = 0; i < tokens.Length; i++)
-            {
-                var text = string.Join(" ", tokens[i]);
-                source.Add(Id(i + 1), new(Id(i + 1), text, tokens[i]));
-            }
-        }
-        else
-        {
-            var data = Path.GetFullPath(Option("--data", "DataSet/processed/enron_1000.jsonl"));
-            var processed = Path.ChangeExtension(data, null) + "_processed.jsonl";
-            var expected = File.ReadLines(processed).Select(line => JsonSerializer.Deserialize<ProcessedDocument>(line, Wire.Json)!)
-                .ToDictionary(d => d.DocumentId);
-            foreach (var line in File.ReadLines(data))
-            {
-                var document = JsonSerializer.Deserialize<SourceDocument>(line, Wire.Json)!;
-                var words = expected[document.DocumentId].Tokens;
-                if (!TextNormalizer.Tokenize(document.Text).SequenceEqual(words))
-                    throw new InvalidOperationException($"Python/C# normalization differs for document {document.DocumentId}.");
-                source.Add(Id(document.DocumentId), new(Id(document.DocumentId), document.Text, words.Distinct().ToArray()));
-            }
-            foreach (var file in new[] { data, processed })
-            {
-                using var stream = File.OpenRead(file);
-                inputHashes[Path.GetFileName(file)] = Convert.ToHexString(SHA256.HashData(stream));
-            }
-        }
-        if (command == "validate-dataset")
-        {
-            File.WriteAllBytes(Path.Combine(output, "normalization.json"), Wire.Encode(new { documents = source.Count, inputHashes, passed = true }));
-            Console.WriteLine($"NORMALIZATION PASS: {source.Count} documents equal Python token sequences.");
-            return;
-        }
-        var frequencies = source.Values.SelectMany(d => d.Words.Distinct()).GroupBy(w => w)
-            .OrderBy(g => g.Count()).ThenBy(g => g.Key, StringComparer.Ordinal).ToArray();
-        var queries = smoke ? new[] { "alpha", "beta", "gamma", "delta", "epsilon", "absent" }
-            : new[] { frequencies[0].Key, frequencies[frequencies.Length / 2].Key,
-                frequencies[(int)(frequencies.Length * .9)].Key, frequencies[^1].Key, "ciphersearchabsentkeyword" }.Distinct().ToArray();
+        var queriesPerClass = int.Parse(Option("--queries-per-class", "20"));
+        var mutationCount = int.Parse(Option("--mutations", smoke ? "45" : "300"));
+        var note = Option("--note", "");
+        var setup = BenchmarkPlanner.Prepare(smoke, data, queriesPerClass, mutationCount, Console.WriteLine);
+        var source = setup.Documents.ToDictionary(d => d.Id, d => new OracleDocument(d.Id, d.Text, d.Words));
+        var querySpecs = setup.Queries;
+        var queryWords = setup.QueryWords;
+        var plan = setup.Workload;
+
         var measurements = new List<Measurement>();
         var summaries = new List<RunSummary>();
         var resumes = new List<ResumeRecord>();
@@ -104,19 +79,14 @@ internal static class ExperimentRunner
         if (schemes.Length == 0 || schemes.Distinct().Count() != schemes.Length ||
             schemes.Any(s => s is not (SchemeIds.NaiveHmac or SchemeIds.Mitra or SchemeIds.Kamara)))
             throw new ArgumentException("Invalid --schemes list.");
-        var mutationCount = smoke ? 45 : 15;
-        var initialPairs = source.Values.Sum(d => (long)d.Words.Length);
-        // Each workload mutation introduces at most three pairs. Round the public
-        // capacity up in blocks rather than publishing the exact initial pair count.
-        var requiredCapacity = initialPairs + mutationCount * 3L;
+        var kamaraFreeSlots = setup.KamaraFreeSlots;
         var kamaraCapacity = 16_384;
         if (schemes.Contains(SchemeIds.Kamara))
         {
-            if (requiredCapacity > 1_000_000)
-                throw new ArgumentException($"Kamara requires at least {requiredCapacity} slots including mutation reserve; the protocol limit is 1000000.");
-            kamaraCapacity = (int)Math.Min(1_000_000, ((requiredCapacity + 16_383) / 16_384) * 16_384);
-            Console.WriteLine($"Kamara capacity={kamaraCapacity}, initialPairs={initialPairs}, mutationReserve={mutationCount * 3}");
+            kamaraCapacity = BenchmarkPlanner.KamaraCapacityFor(setup.RequiredKamaraCapacity);
+            Console.WriteLine($"Kamara capacity={kamaraCapacity}, initialPairs={setup.InitialPairs}, freeSlots={kamaraFreeSlots} (workload peak {plan.PeakExtraPairs} + margin {BenchmarkPlanner.KamaraFreeMargin})");
         }
+        var repetitions = smoke ? 1 : 5;
         for (var run = 1; run <= runs; run++)
         foreach (var scheme in schemes.Skip((run - 1) % schemes.Length).Concat(schemes.Take((run - 1) % schemes.Length)))
         {
@@ -128,23 +98,24 @@ internal static class ExperimentRunner
             var client = new DocumentClient(http, scope, vault, kamaraCapacity);
             var oracle = new Dictionary<Guid, OracleDocument>(source);
             Console.WriteLine($"START run={run} scheme={scheme} documents={source.Count}");
-            await Measure("build", "", source.Count, async () =>
+            await Measure("build", "", "", source.Count, 0, async () =>
             {
                 if (scheme == SchemeIds.Kamara)
                 {
-                    await Measure("setup", "", source.Count, () => client.InitializeKamaraCollection(
-                        source.Values.Select(d => (d.Id, d.Text)).ToArray(), kamaraCapacity, mutationCount * 3));
+                    await Measure("setup", "", "", source.Count, 0, () => client.InitializeKamaraCollection(
+                        source.Values.Select(d => (d.Id, d.Text)).ToArray(), kamaraCapacity, checked((int)kamaraFreeSlots)));
                     return;
                 }
-                await Measure("setup", "", 0, () => client.Initialize());
-                await Measure("ingest", "", source.Count, async () =>
+                await Measure("setup", "", "", 0, 0, () => client.Initialize());
+                await Measure("ingest", "", "", source.Count, 0, async () =>
                 {
                     foreach (var doc in source.Values)
                         await client.Mutate(MutationKind.Add, doc.Id, doc.Text);
                 });
             });
             var status = await client.Status();
-            var stateBytes = Directory.EnumerateFiles(vaultDir).Sum(f => new FileInfo(f).Length);
+            var stateBytes = VaultBytes(vaultDir);
+            var algorithmBytes = AlgorithmStateBytes(vaultDir, scheme);
             long encryptedBytes = 0;
             foreach (var doc in source.Values)
             {
@@ -152,73 +123,93 @@ internal static class ExperimentRunner
                 encryptedBytes += Wire.Encode(new EncryptedDocument(doc.Id, 1, new(1, 1,
                     new byte[12], new byte[System.Text.Encoding.UTF8.GetByteCount(doc.Text)], new byte[16]))).Length;
             }
-            summaries.Add(new(scope, run, source.Count, status.IndexBytes, status.IndexEntries, stateBytes, encryptedBytes, vaultDir));
-            foreach (var query in queries)
+            foreach (var query in querySpecs)
             {
-                await Verify(client, oracle, query, false);
-                var expected = oracle.Values.Where(d => d.Words.Contains(query)).Select(d => d.Id).ToHashSet();
-                for (var repetition = 0; repetition < (smoke ? 1 : 5); repetition++)
+                // The unmeasured check also serves as this query's warm-up.
+                await Verify(client, oracle, query.Word, false);
+                var expected = oracle.Values.Where(d => d.Words.Contains(query.Word)).Select(d => d.Id).ToHashSet();
+                for (var repetition = 0; repetition < repetitions; repetition++)
                     await MeasureSearch(query, expected, false);
                 await MeasureSearch(query, expected, true);
             }
-            var random = new Random(2026);
-            for (var step = 0; step < mutationCount; step++)
+            foreach (var step in plan.Steps)
             {
-                var kind = (MutationKind)(step % 3);
-                var id = kind == MutationKind.Add ? Id(1000000 + step) : oracle.Keys.OrderBy(x => x).ElementAt(random.Next(oracle.Count));
-                string[] words = [queries[step % queries.Length], "changed", "alpha"];
-                var text = string.Join(" ", words);
-                if (smoke && step == 0) handler.DropNextMutationResponse = true;
-                await Measure(kind.ToString().ToLowerInvariant(), "", 0, async () =>
+                var kind = step.Kind;
+                if (smoke && step.Step == 0) handler.DropNextMutationResponse = true;
+                await Measure(kind.ToString().ToLowerInvariant(), "", "",
+                    kind == MutationKind.Delete ? step.PreviousWords.Length : step.Words.Length,
+                    kind == MutationKind.Update ? step.PreviousWords.Length : 0, async () =>
                 {
-                    try { await client.Mutate(kind, id, kind == MutationKind.Delete ? null : text); }
-                    catch (HttpRequestException) when (smoke && step == 0)
+                    try { await client.Mutate(kind, step.Id, step.Text); }
+                    catch (HttpRequestException) when (smoke && step.Step == 0)
                     {
                         await client.Recover();
                         var recovered = await client.Status();
                         if (recovered.Epoch != source.Count + 1) throw new InvalidOperationException("Replay changed epoch.");
                     }
                 });
-                if (kind == MutationKind.Delete) oracle.Remove(id);
-                else oracle[id] = new(id, text, words.Distinct().ToArray());
-                foreach (var query in queries.Append("changed").Distinct())
-                    await Verify(client, oracle, query, smoke);
+                if (kind == MutationKind.Delete) oracle.Remove(step.Id);
+                else oracle[step.Id] = new(step.Id, step.Text!, step.Words);
+                // Unmeasured correctness check. Smoke checks every query; the benchmark checks one
+                // word per class plus the words of the changed document (the oracle tests cover the rest).
+                var verifyWords = smoke ? queryWords.Append("changed").Distinct()
+                    : setup.CheckWords.Concat(step.PreviousWords.Take(4)).Concat(step.Words.Take(4)).Distinct();
+                foreach (var word in verifyWords) await Verify(client, oracle, word, smoke);
             }
-            resumes.Add(new(scope, vaultDir, oracle.Values.ToArray(), queries.Append("changed").Distinct().ToArray()));
+            foreach (var word in smoke ? queryWords.Append("changed").Distinct() : queryWords)
+                await Verify(client, oracle, word, false);
+            var finalStatus = await client.Status();
+            summaries.Add(new(scope, run, source.Count, status.IndexBytes, status.IndexEntries, stateBytes, algorithmBytes,
+                finalStatus.IndexBytes, finalStatus.IndexEntries, VaultBytes(vaultDir),
+                AlgorithmStateBytes(vaultDir, scheme), encryptedBytes, vaultDir));
+            resumes.Add(new(scope, vaultDir, oracle.Values.ToArray(), smoke ? queryWords.Append("changed").Distinct().ToArray() : queryWords));
             File.WriteAllBytes(Path.Combine(output, "resume.json"), Wire.Encode(resumes));
             File.WriteAllBytes(Path.Combine(output, "results.json"), Wire.Encode(new
             {
-                schemaVersion = 2, command, inputHashes, seed = 2026, queries, runsCompleted = summaries.Count,
+                schemaVersion = 3, command, inputHashes = setup.InputHashes, seed = 2026, note,
+                queries = querySpecs, queriesPerClass,
+                queryClassThresholds = new
+                {
+                    rareMaxDocumentFrequency = BenchmarkPlanner.RareMaxDocumentFrequency,
+                    frequentMinDocumentFrequency = BenchmarkPlanner.FrequentMinDocumentFrequency
+                },
+                mutations = mutationCount, workload = setup.WorkloadKind,
+                workloadInitialPairs = plan.InitialPairs, workloadPeakPairs = plan.PeakPairs,
+                runsCompleted = summaries.Count,
                 kamaraCapacity = schemes.Contains(SchemeIds.Kamara) ? (int?)kamaraCapacity : null,
+                kamaraFreeSlots = schemes.Contains(SchemeIds.Kamara) ? (long?)kamaraFreeSlots : null,
                 runtime = System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription,
                 os = System.Runtime.InteropServices.RuntimeInformation.OSDescription,
+                processArchitecture = System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture.ToString(),
+                processorIdentifier = Environment.GetEnvironmentVariable("PROCESSOR_IDENTIFIER"),
+                totalMemoryBytes = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes,
                 processorCount = Environment.ProcessorCount, summaries, measurements
             }));
             Console.WriteLine($"PASS run={run} scheme={scheme} indexBytes={status.IndexBytes} clientBytes={stateBytes}");
 
-            async Task Measure(string operation, string query, int resultCount, Func<Task> action)
+            async Task Measure(string operation, string query, string queryClass, int items, int previousItems, Func<Task> action)
             {
                 var requestStart = client.RequestBytes; var responseStart = client.ResponseBytes;
                 var timer = Stopwatch.StartNew();
                 await action();
                 timer.Stop();
-                measurements.Add(new(scheme, run, operation, query, resultCount, timer.Elapsed.TotalMilliseconds,
-                    client.RequestBytes - requestStart, client.ResponseBytes - responseStart));
+                measurements.Add(new(scheme, run, operation, query, queryClass, items, previousItems,
+                    timer.Elapsed.TotalMilliseconds, client.RequestBytes - requestStart, client.ResponseBytes - responseStart));
             }
 
-            async Task MeasureSearch(string query, HashSet<Guid> expected, bool decrypt)
+            async Task MeasureSearch(BenchmarkQuery query, HashSet<Guid> expected, bool decrypt)
             {
                 IReadOnlyList<DocumentMatch> matches = [];
                 var plaintexts = decrypt ? new List<string>(expected.Count) : null;
                 // Time the client operation only; the plaintext oracle is checked afterward.
-                await Measure(decrypt ? "search-and-decrypt" : "search", query, expected.Count, async () =>
+                await Measure(decrypt ? "search-and-decrypt" : "search", query.Word, query.Class, expected.Count, 0, async () =>
                 {
-                    matches = await client.Search(query);
+                    matches = await client.Search(query.Word);
                     if (decrypt)
                         foreach (var match in matches)
                             plaintexts!.Add(await client.Read(match));
                 });
-                VerifyMatches(matches, expected, query);
+                VerifyMatches(matches, expected, query.Word);
                 if (decrypt)
                     for (var i = 0; i < matches.Count; i++)
                         if (plaintexts![i] != oracle[matches[i].DocumentId].Text)
@@ -228,11 +219,14 @@ internal static class ExperimentRunner
         Console.WriteLine($"ALL PASS: {Path.Combine(output, "results.json")}");
     }
 
-    private static Guid Id(int number)
+    private static long VaultBytes(string directory) =>
+        Directory.EnumerateFiles(directory).Sum(f => new FileInfo(f).Length);
+
+    private static long AlgorithmStateBytes(string directory, string scheme)
     {
-        var bytes = new byte[16];
-        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(bytes.AsSpan(12), number);
-        return new Guid(bytes);
+        var name = scheme switch { SchemeIds.NaiveHmac => "naive", SchemeIds.Mitra => "mitra", _ => "kamara" };
+        var path = Path.Combine(directory, name + ".state");
+        return File.Exists(path) ? new FileInfo(path).Length : 0;
     }
 
     private static async Task Verify(DocumentClient client, Dictionary<Guid, OracleDocument> oracle, string query, bool decrypt)

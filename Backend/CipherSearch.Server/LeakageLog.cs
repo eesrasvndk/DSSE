@@ -4,6 +4,9 @@ namespace CipherSearch.Server;
 
 public sealed class LeakageLog(IConfiguration configuration, ILogger<LeakageLog> logger, IHostEnvironment? environment = null)
 {
+    // Benchmarks set Leakage__Enabled=false so the per-request file append stays out of
+    // the latency the client measures. The in-memory search observation is unaffected.
+    private readonly bool persist = configuration.GetValue("Leakage:Enabled", true);
     private readonly SemaphoreSlim gate = new(1);
     private readonly Queue<(Guid GenerationId, SearchObservation Observation)> recentSearches = new();
     private long sequence;
@@ -30,6 +33,7 @@ public sealed class LeakageLog(IConfiguration configuration, ILogger<LeakageLog>
                 if (recentSearches.Count > 32) recentSearches.Dequeue();
             }
         }
+        if (!persist) return;
         var path = configuration["Leakage:Path"];
         if (string.IsNullOrWhiteSpace(path)) return;
         var entry = new LeakageEvent(1, scope.GenerationId, Interlocked.Increment(ref sequence),
